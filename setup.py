@@ -1,45 +1,37 @@
-import os
+import pathlib
 import re
-from setuptools import find_packages, setup
+
+import setuptools
 
 
-READMEFILE = "README.md"
-VERSIONFILE = os.path.join("mds", "_version.py")
-VSRE = r"^__version__ = ['\"]([^'\"]*)['\"]"
+__version__ = re.search(
+    r"__version__ = ['\"]([^'\"]*)['\"]",
+    pathlib.Path("mds", "versions.py").read_text()
+    ).group(1)
 
-
-def get_version():
-    verstrline = open(VERSIONFILE, "rt").read()
-    mo = re.search(VSRE, verstrline, re.M)
-    if mo:
-        return mo.group(1)
-    else:
-        raise RuntimeError("Unable to find version string in %s." % VERSIONFILE)
-
-
-setup(
-    name="mds_provider",
-    version=get_version(),
+setuptools.setup(
+    name="mds-provider",
+    version=__version__,
     description="Tools for working with Mobility Data Specification Provider data",
-    long_description=open(READMEFILE).read(),
+    long_description=pathlib.Path("README.md").read_text(),
     url="https://github.com/CityofSantaMonica/mds-provider",
     author="City of Santa Monica and contributors",
     license="MIT",
-    packages=find_packages(),
+    packages=setuptools.find_packages(),
     include_package_data=True,
     install_requires=[
         "Fiona",
-        "jsonschema >= 3.0.0a2",
-        "numpy",
+        "jsonschema",
+        "packaging",
         "pandas",
         "psycopg2-binary",
+        "python-dateutil",
         "requests",
         "scipy",
         "Shapely",
         "sqlalchemy"
     ],
     classifiers=[
-        "Environment :: Docker",
         "Intended Audience :: Developers",
         "License :: OSI Approved :: MIT License",
         "Operating System :: OS Independent",

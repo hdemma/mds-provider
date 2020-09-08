@@ -1,35 +1,408 @@
 """
-MDS Provider API client implementation. 
+MDS Provider API client implementation.
 """
 
-from datetime import datetime
-import json
-import mds
+import datetime
 import time
-from mds.api.auth import auth_types
-from mds.providers import get_registry, Provider
+
+from ..encoding import TimestampEncoder, TimestampDecoder
+from ..files import ConfigFile
+from ..providers import Provider
+from ..schemas import STATUS_CHANGES, TRIPS, EVENTS, VEHICLES, Schema
+from ..versions import Version
+from .auth import auth_types
 
 
-class ProviderClient():
+class Client():
     """
-    Client for MDS Provider APIs
+    Client for MDS Provider APIs.
     """
-    def __init__(self, providers=None, ref=None):
-        """
-        Initialize a new ProviderClient object.
 
-        :providers: is a list of Providers this client tracks by default. If None is given, downloads and uses the official Provider registry.
-
-        When using the official Providers registry, :ref: could be any of:
-            - git branch name
-            - commit hash (long or short)
-            - git tag
+    def __init__(self, provider=None, config={}, **kwargs):
         """
-        self.providers = providers if providers is not None else get_registry(ref)
+        Parameters:
+            provider: str, UUID, Provider, optional
+                Provider instance or identifier that this client queries by default.
 
-    def _auth_session(self, provider):
+            config: dict, ConfigFile, optional
+                Attributes to merge with the Provider instance.
+
+            version: str, Version, optional
+                The MDS version to target. By default, use Version.mds_lower().
+
+        Extra keyword arguments are taken as config attributes for the Provider.
         """
-        Internal helper to establish an authenticated session with the provider.
+        if isinstance(config, ConfigFile):
+            config = config.dump()
+
+        # look for version first in config, then kwargs, then use default
+        self.version = Version(config.pop("version", kwargs.pop("version", Version.mds_lower())))
+        self.version.raise_if_unsupported()
+
+        # merge config with the rest of kwargs
+        self.config = { **config, **kwargs }
+
+        self.provider = None
+        if provider:
+            self.provider = Provider(provider, ref=self.version, **self.config)
+
+    def __repr__(self):
+        data = [str(self.version)]
+        if self.provider:
+            data.append(self.provider.provider_name)
+        data = "'" + "', '".join(data) + "'"
+        return f"<mds.api.Client ({data})>"
+
+    def _media_type_version_header(self, version):
+        """
+        The custom MDS media-type and version header, using this client's version
+        """
+        return "Accept", f"application/vnd.mds.provider+json;version={version.header}"
+
+    def _provider_or_raise(self, provider, **kwargs):
+        """
+        Get a Provider instance from the argument, self, or raise an error.
+        """
+        provider = provider or self.provider
+
+        if provider is None:
+            raise ValueError("Provider instance not found for this Client.")
+
+        return Provider(provider, **kwargs)
+
+    def get(self, record_type, provider=None, **kwargs):
+        """
+        Request Provider data, returning a list of non-empty payloads.
+
+        Parameters:
+            record_type: str
+                The type of MDS Provider record.
+
+            provider: str, UUID, Provider, optional
+                Provider instance or identifier to issue this request to.
+                By default issue the request to this client's Provider instance.
+
+            config: dict, ConfigFile, optional
+                Attributes to merge with the Provider instance.
+
+            end_time: datetime, int, optional
+                When version < 0.4.0 and requesting status_changes, filters for events occurring before the given time.
+                When version >= 0.4.0 and requesting trips, filters for trips ending within the hour of the given
+                timestamp. Invalid for other use-cases.
+                Should be a datetime or int UNIX milliseconds.
+
+            event_time: datetime, int, optional
+                When version >= 0.4.0 and requesting status_changes, filters for events occurring within the hour of
+                the given timestamp. Invalid for other use-cases.
+                Should be a datetime or int UNIX milliseconds.
+
+            max_end_time: datetime, int, optional
+                When version < 0.4.0 and requesting trips, filters for trips where end_time occurs before the given
+                time. Invalid for other use-cases.
+                Should be a datetime or int UNIX milliseconds.
+
+            min_end_time: datetime, int, optional
+                when version < 0.4.0 and requesting trips, filters for trips where end_time occurs at or after the
+                given time. Invalid for other use-cases.
+                Should be a datetime or int UNIX milliseconds.
+
+            paging: bool, optional
+                When version < 0.4.0, True (default) to follow paging and request all available data.
+                False to request only the first page.
+                Unsupported for version >= 0.4.0.
+
+            start_time: datetime, int, optional
+                When version < 0.4.0 and requesting status_changes, filters for events occuring at or after
+                the given time. Invalid for other use-cases.
+                Should be a datetime or int UNIX milliseconds.
+
+            rate_limit: int, optional
+                Number of seconds of delay to insert between paging requests.
+
+            version: str, Version, optional
+                The MDS version to target.
+
+            Additional keyword arguments are passed through as API request parameters.
+
+        Return:
+            list
+                The non-empty payloads (e.g. payloads with data records), one for each requested page.
+        """
+        version = Version(kwargs.pop("version", self.version))
+        version.raise_if_unsupported()
+
+        if version < Version._040_():
+            if record_type not in [STATUS_CHANGES, TRIPS]:
+                raise ValueError(f"MDS Version {version} only supports {STATUS_CHANGES} and {TRIPS}.")
+            # adjust time query formats
+            if record_type == STATUS_CHANGES:
+                kwargs["start_time"] = self._date_format(kwargs.pop("start_time", None), version, record_type)
+                kwargs["end_time"] = self._date_format(kwargs.pop("end_time", None), version, record_type)
+            elif record_type == TRIPS:
+                kwargs["min_end_time"] = self._date_format(kwargs.pop("min_end_time", None), version, record_type)
+                kwargs["max_end_time"] = self._date_format(kwargs.pop("max_end_time", None), version, record_type)
+        elif version < Version._041_() and record_type == VEHICLES:
+            raise ValueError(f"MDS Version {version} does not support the {VEHICLES} endpoint.")
+        else:
+            # parameter checks for record_type and version
+            Client._params_check(record_type, version, **kwargs)
+            # adjust query params
+            if record_type == STATUS_CHANGES:
+                kwargs["event_time"] = self._date_format(kwargs.pop("event_time"), version, record_type)
+            elif record_type == TRIPS:
+                kwargs["end_time"] = self._date_format(kwargs.pop("end_time"), version, record_type)
+                # remove unsupported params
+                kwargs.pop("device_id", None)
+                kwargs.pop("vehicle_id", None)
+            elif record_type == EVENTS:
+                kwargs["start_time"] = self._date_format(kwargs.pop("start_time"), version, record_type)
+                kwargs["end_time"] = self._date_format(kwargs.pop("end_time"), version, record_type)
+
+        config = kwargs.pop("config", self.config)
+        provider = self._provider_or_raise(provider, **config)
+        rate_limit = int(kwargs.pop("rate_limit", 0))
+
+        # paging is only supported for status_changes and trips prior to version 0.4.1
+        paging_supported = any([
+            (record_type in [STATUS_CHANGES, TRIPS] and version < Version._041_()),
+            record_type not in [STATUS_CHANGES, TRIPS]
+        ])
+        paging = paging_supported and bool(kwargs.pop("paging", True))
+
+        if not hasattr(provider, "headers"):
+            setattr(provider, "headers", {})
+
+        provider.headers.update(dict([(self._media_type_version_header(version))]))
+
+        # request
+        return self._request(provider, record_type, kwargs, paging, rate_limit)
+
+    def get_status_changes(self, provider=None, **kwargs):
+        """
+        Request status changes, returning a list of non-empty payloads.
+
+        Parameters:
+            provider: str, UUID, Provider, optional
+                Provider instance or identifier to issue this request to.
+                By default issue the request to this client's Provider instance.
+
+            config: dict, ConfigFile, optional
+                Attributes to merge with the Provider instance.
+
+            start_time: datetime, int, optional
+                When version < 0.4.0, filters for events occuring at or after the given time.
+                Invalid for other use-cases.
+                Should be a datetime or int UNIX milliseconds.
+
+            end_time: datetime, int, optional
+                When version < 0.4.0, filters for events occurring before the given time.
+                Invalid for other use-cases.
+                Should be a datetime or int UNIX milliseconds.
+
+            event_time: datetime, int, optional
+                When version >= 0.4.0, filters for events occurring within the hour of the given timestamp.
+                Invalid for other use-cases.
+                Should be a datetime or int UNIX milliseconds.
+
+            paging: bool, optional
+                When version < 0.4.0, True (default) to follow paging and request all available data.
+                False to request only the first page.
+                Unsupported for version >= 0.4.0.
+
+            rate_limit: int, optional
+                Number of seconds of delay to insert between paging requests.
+
+            version: str, Version, optional
+                The MDS version to target.
+
+            Additional keyword arguments are passed through as API request parameters.
+
+        Return:
+            list
+                The non-empty payloads (e.g. payloads with data records), one for each requested page.
+        """
+        version = Version(kwargs.get("version", self.version))
+        version.raise_if_unsupported()
+
+        Client._params_check(STATUS_CHANGES, version, **kwargs)
+
+        return self.get(STATUS_CHANGES, provider, **kwargs)
+
+    def get_trips(self, provider=None, **kwargs):
+        """
+        Request trips, returning a list of non-empty payloads.
+
+        Parameters:
+            provider: str, UUID, Provider, optional
+                Provider instance or identifier to issue this request to.
+                By default issue the request to this client's Provider instance.
+
+            config: dict, ConfigFile, optional
+                Attributes to merge with the Provider instance.
+
+            device_id: str, UUID, optional
+                When version < 0.4.0, filters for trips taken by the given device.
+                Invalid for other use-cases.
+
+            vehicle_id: str, optional
+                When version < 0.4.0, filters for trips taken by the given vehicle.
+                Invalid for other use-cases.
+
+            end_time: datetime, int, optional
+                When version >= 0.4.0, filters for trips ending within the hour of the given timestamp.
+                Invalid for other use-cases.
+                Should be a datetime or int UNIX milliseconds.
+
+            max_end_time: datetime, int, optional
+                When version < 0.4.0, filters for trips where end_time occurs before the given time.
+                Invalid for other use-cases.
+                Should be a datetime or int UNIX milliseconds.
+
+            min_end_time: datetime, int, optional
+                when version < 0.4.0, filters for trips where end_time occurs at or after the given time.
+                Invalid for other use-cases.
+                Should be a datetime or int UNIX milliseconds.
+
+            paging: bool, optional
+                When version < 0.4.0, True (default) to follow paging and request all available data.
+                False to request only the first page.
+                Unsupported for version >= 0.4.0,
+
+            rate_limit: int, optional
+                Number of seconds of delay to insert between paging requests.
+
+            version: str, Version, optional
+                The MDS version to target.
+
+            Additional keyword arguments are passed through as API request parameters.
+
+        Return:
+            list
+                The non-empty payloads (e.g. payloads with data records), one for each requested page.
+        """
+        version = Version(kwargs.get("version", self.version))
+        version.raise_if_unsupported()
+
+        Client._params_check(TRIPS, version, **kwargs)
+
+        return self.get(TRIPS, provider, **kwargs)
+
+    def get_events(self, provider=None, **kwargs):
+        """
+        Request events, returning a list of non-empty payloads.
+
+        Parameters:
+            provider: str, UUID, Provider, optional
+                Provider instance or identifier to issue this request to.
+                By default issue the request to this client's Provider instance.
+
+            config: dict, ConfigFile, optional
+                Attributes to merge with the Provider instance.
+
+            paging: bool, optional
+                True (default) to follow paging and request all available data.
+                False to request only the first page.
+
+            rate_limit: int, optional
+                Number of seconds of delay to insert between paging requests.
+
+            version: str, Version, optional
+                The MDS version to target.
+
+            Additional keyword arguments are passed through as API request parameters.
+
+        Return:
+            list
+                The non-empty payloads (e.g. payloads with data records), one for each requested page.
+        """
+        version = Version(kwargs.get("version", self.version))
+        version.raise_if_unsupported()
+
+        if version < Version._040_():
+            raise ValueError(f"MDS Version {version} does not support the events endpoint.")
+
+        Client._params_check(EVENTS, version, **kwargs)
+
+        return self.get(EVENTS, provider, **kwargs)
+
+    def get_vehicles(self, provider=None, **kwargs):
+        """
+        Request vehicles, returning a list of non-empty payloads.
+
+        Parameters:
+            provider: str, UUID, Provider, optional
+                Provider instance or identifier to issue this request to.
+                By default issue the request to this client's Provider instance.
+
+            config: dict, ConfigFile, optional
+                Attributes to merge with the Provider instance.
+
+            paging: bool, optional
+                True (default) to follow paging and request all available data.
+                False to request only the first page.
+
+            rate_limit: int, optional
+                Number of seconds of delay to insert between paging requests.
+
+            version: str, Version, optional
+                The MDS version to target.
+
+            Additional keyword arguments are passed through as API request parameters.
+
+        Return:
+            list
+                The non-empty payloads (e.g. payloads with data records), one for each requested page.
+        """
+        version = Version(kwargs.get("version", self.version))
+        version.raise_if_unsupported()
+
+        if version < Version._041_():
+            raise ValueError(f"MDS Version {version} does not support the {VEHICLES} endpoint.")
+
+        Client._params_check(VEHICLES, version, **kwargs)
+
+        return self.get(VEHICLES, provider, **kwargs)
+
+    @staticmethod
+    def _request(provider, record_type, params, paging, rate_limit):
+        """
+        Send one or more requests to a provider's endpoint.
+
+        Returns a list of payloads, with length corresponding to the number of non-empty responses.
+        """
+        # establish an authenticated session
+        session = Client._session(provider)
+        url = provider.endpoints[record_type]
+        results = []
+        first = True
+
+        while (first or paging) and url:
+            # get the page of data
+            if first:
+                r = session.get(url, params=params)
+                first = False
+            else:
+                r = session.get(url)
+            # bail for non-200 status
+            if r.status_code != 200:
+                Client._describe(r)
+                break
+            # check payload for data
+            # for vehicles, keep payload regardless as last_updated and ttl info may be useful
+            payload = r.json()
+            if record_type == VEHICLES or Client._has_data(payload, record_type):
+                results.append(payload)
+            # check for next page
+            url = Client._next_url(payload)
+            if url and rate_limit:
+                time.sleep(rate_limit)
+
+        return results
+
+    @staticmethod
+    def _session(provider):
+        """
+        Establish an authenticated session with the provider.
 
         The provider is checked against all immediate subclasses of AuthorizationToken (and that class itself)
         and the first supported implementation is used to establish the authenticated session.
@@ -40,219 +413,80 @@ class ProviderClient():
             if getattr(auth_type, "can_auth")(provider):
                 return auth_type(provider).session
 
-        raise ValueError(f"Couldn't find a supported auth type for {provider}")
+        raise ValueError(f"A supported auth type for {provider.provider_name} could not be found.")
 
-    def _build_url(self, provider, endpoint):
+    @staticmethod
+    def _describe(res):
         """
-        Internal helper for building API urls.
+        Prints details about the given response.
         """
-        url = provider.mds_api_url
+        print(f"Requested {res.url}, Response Code: {res.status_code}")
+        print("Response Headers:")
+        for k,v in res.headers.items():
+            print(f"{k}: {v}")
 
-        if hasattr(provider, "mds_api_suffix"):
-            url += "/" + getattr(provider, "mds_api_suffix").rstrip("/")
+        if res.status_code != 200:
+            print(res.text)
 
-        url += "/" + endpoint
-
-        return url
-
-    def _request(self, providers, endpoint, params, paging, rate_limit):
+    @staticmethod
+    def _has_data(page, record_type):
         """
-        Internal helper for sending requests.
-
-        Returns a dict of provider => payload(s).
+        Checks if this page has a "data" property with a non-empty payload.
         """
-        def __describe(res):
-            """
-            Prints details about the given response.
-            """
-            print(f"Requested {res.url}, Response Code: {res.status_code}")
-            print("Response Headers:")
-            for k,v in res.headers.items():
-                print(f"{k}: {v}")
+        data = page["data"] if "data" in page else {"__payload__": []}
+        data_key = Schema(record_type).data_key
+        payload = data[data_key] if data_key in data else []
+        print(f"Got payload with {len(payload)} {record_type}")
+        return len(payload) > 0
 
-            if r.status_code is not 200:
-                print(r.text)
-
-        def __has_data(page):
-            """
-            Checks if this :page: has a "data" property with a non-empty payload
-            """
-            data = page["data"] if "data" in page else {"__payload__": []}
-            payload = data[endpoint] if endpoint in data else []
-            print(f"Got payload with {len(payload)} {endpoint}")
-            return len(payload) > 0
-
-        def __next_url(page):
-            """
-            Gets the next URL or None from :page:
-            """
-            return page["links"].get("next") if "links" in page else None
-
-        # create a request url for each provider
-        urls = [self._build_url(p, endpoint) for p in providers]
-
-        # keyed by provider
-        results = {}
-
-        for i in range(len(providers)):
-            provider, url = providers[i], urls[i]
-
-            # establish an authenticated session
-            session = self._auth_session(provider)
-
-            # get the initial page of data
-            r = session.get(url, params=params)
-
-            if r.status_code is not 200:
-                __describe(r)
-                continue
-
-            this_page = r.json()
-
-            # track the list of pages per provider
-            results[provider] = [this_page] if __has_data(this_page) else []
-
-            # get subsequent pages of data
-            next_url = __next_url(this_page)
-            while paging and next_url:
-                r = session.get(next_url)
-
-                if r.status_code is not 200:
-                    __describe(r)
-                    break
-
-                this_page = r.json()
-
-                if __has_data(this_page):
-                    results[provider].append(this_page)
-            
-                next_url = __next_url(this_page)
-
-                if next_url and rate_limit:
-                    time.sleep(rate_limit)
-
-        return results
-
-    def _date_format(self, dt):
+    @staticmethod
+    def _next_url(page):
         """
-        Internal helper to format datetimes for querystrings.
+        Gets the next URL or None from page.
         """
-        return int(dt.timestamp()) if isinstance(dt, datetime) else int(dt)
+        return page["links"].get("next") if "links" in page else None
 
-    def get_status_changes(
-        self,
-        providers=None,
-        start_time=None,
-        end_time=None,
-        bbox=None,
-        paging=True,
-        rate_limit=0,
-        **kwargs):
+    @staticmethod
+    def _date_format(dt, version, record_type):
         """
-        Request Status Changes data. Returns a dict of provider => list of status_changes payload(s)
-
-        Supported keyword args:
-
-            - `providers`: One or more Providers to issue this request to.
-                           The default is to issue the request to all Providers.
-
-            - `start_time`: Filters for status changes where `event_time` occurs at or after the given time
-                            Should be a datetime object or numeric representation of UNIX seconds
-
-            - `end_time`: Filters for status changes where `event_time` occurs at or before the given time
-                          Should be a datetime object or numeric representation of UNIX seconds
-
-            - `bbox`: Filters for status changes where `event_location` is within defined bounding-box.
-                      The order is defined as: southwest longitude, southwest latitude, 
-                      northeast longitude, northeast latitude (separated by commas).
-
-                      e.g.
-
-                      bbox=-122.4183,37.7758,-122.4120,37.7858
-
-            - `paging`: True (default) to follow paging and request all available data.
-                        False to request only the first page.
-
-            - `rate_limit`: Number of seconds of delay to insert between paging requests.
+        Format datetimes for querystrings.
         """
-        if providers is None:
-            providers = self.providers
+        if dt is None:
+            return None
+        if not isinstance(dt, datetime.datetime):
+            # convert to datetime using decoder
+            dt = TimestampDecoder(version=version).decode(dt)
 
-        # convert datetimes to querystring friendly format
-        if start_time is not None:
-            start_time = self._date_format(start_time)
-        if end_time is not None:
-            end_time = self._date_format(end_time)
+        if version >= Version._040_() and record_type in [STATUS_CHANGES, TRIPS]:
+            encoder = TimestampEncoder(version=version, date_format="hours")
+        else:
+            encoder = TimestampEncoder(version=version, date_format="unix")
 
-        # gather all the params together
-        params = {
-            **dict(start_time=start_time, end_time=end_time, bbox=bbox),
-            **kwargs
-        }
+        return encoder.encode(dt)
 
-        # make the request(s)
-        status_changes = self._request(providers, mds.STATUS_CHANGES, params, paging, rate_limit)
-
-        return status_changes
-
-    def get_trips(
-        self,
-        providers=None,
-        device_id=None,
-        vehicle_id=None,
-        start_time=None,
-        end_time=None,
-        bbox=None,
-        paging=True,
-        rate_limit=0,
-        **kwargs):
+    @staticmethod
+    def _params_check(record_type, version, **kwargs):
         """
-        Request Trips data. Returns a dict of provider => list of trips payload(s).
-
-        Supported keyword args:
-
-            - `providers`: One or more Providers to issue this request to.
-                           The default is to issue the request to all Providers.
-
-            - `device_id`: Filters for trips taken by the given device.
-
-            - `vehicle_id`: Filters for trips taken by the given vehicle.
-
-            - `start_time`: Filters for trips where `start_time` occurs at or after the given time
-                            Should be a datetime object or numeric representation of UNIX seconds
-
-            - `end_time`: Filters for trips where `end_time` occurs at or before the given time
-                          Should be a datetime object or numeric representation of UNIX seconds
-
-            - `bbox`: Filters for trips where and point within `route` is within defined bounding-box.
-                      The order is defined as: southwest longitude, southwest latitude, 
-                      northeast longitude, northeast latitude (separated by commas).
-
-                      e.g.
-
-                      bbox=-122.4183,37.7758,-122.4120,37.7858
-
-            - `paging`: True (default) to follow paging and request all available data.
-                        False to request only the first page.
-
-            - `rate_limit`: Number of seconds of delay to insert between paging requests.
+        Common checks for record_type query parameters.
         """
-        if providers is None:
-            providers = self.providers
+        if record_type == STATUS_CHANGES and version >= Version._040_() and "event_time" not in kwargs:
+            raise TypeError("The 'event_time' query parameter is required for status_changes requests.")
 
-        # convert datetimes to querystring friendly format
-        if start_time is not None:
-            start_time = self._date_format(start_time)
-        if end_time is not None:
-            end_time = self._date_format(end_time)
+        elif record_type == TRIPS and version >= Version._040_() and "end_time" not in kwargs:
+            raise TypeError("The 'end_time' query parameter is required for trips requests.")
 
-        # gather all the params togethers
-        params = {
-            **dict(device_id=device_id, vehicle_id=vehicle_id, start_time=start_time, end_time=end_time, bbox=bbox),
-            **kwargs
-        }
+        elif record_type == EVENTS:
+            if "start_time" not in kwargs and "end_time" not in kwargs:
+                raise TypeError("The 'start_time' and 'end_time' query paramters are required for events requests.")
 
-        # make the request(s)
-        trips = self._request(providers, mds.TRIPS, params, paging, rate_limit)
+            two_weeks = Client._date_format(datetime.datetime.utcnow() - datetime.timedelta(days=14), version, EVENTS)
+            start = Client._date_format(kwargs["start_time"], version, EVENTS)
+            end = Client._date_format(kwargs["end_time"], version, EVENTS)
 
-        return trips
+            # less than --> earlier in time
+            if start < two_weeks or end < two_weeks:
+                raise ValueError("The 'start_time' and 'end_time' query parameters must be within two weeks from now.")
+
+        elif record_type == VEHICLES:
+            # currently no vehicles specific param checks
+            pass

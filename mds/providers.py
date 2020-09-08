@@ -1,100 +1,196 @@
 """
-Work with the official MDS Providers registry.
+Work with Providers from the registry.
 """
-
 import csv
+import pathlib
+import uuid
+
 import requests
-from uuid import UUID
 
-
-PROVIDER_REGISTRY = "https://raw.githubusercontent.com/CityOfLosAngeles/mobility-data-specification/{}/providers.csv"
-DEFAULT_REF = "master"
+import mds.github
+from .schemas import STATUS_CHANGES, TRIPS, EVENTS, VEHICLES
+from .versions import Version
 
 
 class Provider():
     """
-    A simple model for an entry in the Provider registry.
+    A simple model for an entry in a Provider registry.
     """
-    def __init__(self, provider_name, provider_id, url, mds_api_url, **kwargs):
-        self.provider_name = provider_name
-        self.provider_id = provider_id if isinstance(provider_id, UUID) else UUID(provider_id)
-        self.url = self._clean_url(url)
-        self.mds_api_url = self._clean_url(mds_api_url)
 
-        for k,v in kwargs.items():
-            setattr(self, k, v)
+    def __init__(self, identifier=None, ref=mds.github.MDS_DEFAULT_REF, path=None, **kwargs):
+        """
+        Initialize a new Provider instance.
+
+        Parameters:
+            identifier: str, UUID, Provider, optional
+                The provider_id or provider_name from the registry.
+
+            ref: str, Version
+                The reference (git commit, branch, tag, or version) at which to query the registry.
+
+            path: str, Path, optional
+                A path to a local registry file.
+
+            provider_name: str, optional
+                The name of the provider from the registry.
+
+            provider_id: str, UUID
+                The unique identifier for the provider from the registry.
+
+            url: str
+                The provider's website url from the registry.
+
+            mds_api_url: str
+                The provider's base API url from the registry.
+
+            gbfs_api_url: str
+                The provider's GBFS API url from the registry.
+
+            Additional keyword parameters are set as attributes on the Provider instance.
+        """
+        # parsing a Provider record
+        if not identifier:
+            self.provider_name = kwargs.pop("provider_name", None)
+
+            provider_id = kwargs.pop("provider_id", None)
+            self.provider_id = provider_id if isinstance(provider_id, uuid.UUID) else uuid.UUID(provider_id)
+
+            self.auth_type = kwargs.pop("auth_type", "Bearer")
+            self.gbfs_api_url = self._clean_url(kwargs.pop("gbfs_api_url", None))
+            self.headers = kwargs.pop("headers", {})
+            self.mds_api_suffix = kwargs.pop("mds_api_suffix", None)
+            self.mds_api_url = self._clean_url(kwargs.pop("mds_api_url", None))
+            self.registry_path = path
+            self.registry_ref = ref
+            self.url = self._clean_url(kwargs.pop("url", None))
+
+            try:
+                self.version = Version(ref)
+            except:
+                pass
+
+            for k,v in kwargs.items():
+                setattr(self, k, v)
+
+        # copy Provider instance
+        elif isinstance(identifier, Provider):
+            _kwargs = vars(identifier)
+            _kwargs.update(kwargs)
+            Provider.__init__(self, ref=identifier.registry_ref, path=identifier.registry_path, **_kwargs)
+
+        # interrogate the registry
+        else:
+            provider = Registry(ref=ref, path=path).find(identifier, **kwargs)
+            if provider:
+                Provider.__init__(self, provider)
 
     def __repr__(self):
-        return f"<Provider name:'{self.provider_name}' api_url:'{self.mds_api_url}' id:'{str(self.provider_id)}'>"
+        ref, name, pid, url = (
+            self.registry_ref or self.registry_path,
+            self.provider_name,
+            str(self.provider_id),
+            self.mds_api_url
+        )
+        return f"<mds.providers.Provider ('{ref}', '{name}', '{pid}', '{url}')>"
 
-    def _clean_url(self, url):
+    @property
+    def endpoints(self):
+        endpoint = [self.mds_api_url]
+        if self.mds_api_suffix:
+            endpoint.append(self.mds_api_suffix.rstrip("/"))
+        return {
+            STATUS_CHANGES: "/".join(endpoint + [STATUS_CHANGES]),
+            TRIPS: "/".join(endpoint + [TRIPS]),
+            EVENTS: "/".join(endpoint + [EVENTS]),
+            VEHICLES: "/".join(endpoint + [VEHICLES])
+        }
+
+    @staticmethod
+    def _clean_url(url):
         """
         Helper to return a normalized URL
         """
-        url = url.lower().rstrip("/")
-        return url if url.startswith("https://") else f"https://{url}"
+        if url:
+            url = url.lower().rstrip("/")
+            return url if url.startswith("https://") else f"https://{url}"
+        else:
+            return None
 
-    def configure(self, config, use_id=False):
+
+class Registry():
+    """
+    Represents a local or remote Provider registry.
+
+    See: https://github.com/CityOfLosAngeles/mobility-data-specification/blob/master/providers.csv
+    """
+
+    _registry = {}
+
+    def __init__(self, ref=mds.github.MDS_DEFAULT_REF, path=None, **kwargs):
         """
-        Merge Provider-specific data from :config: with this provider.
+        Parameters:
+            ref: str, Version
+                The reference (git commit, branch, tag, or version) at which to query the registry.
+                By default, download from GitHub master.
 
-        Returns a new Provider with the merged data.
-
-        :use_id: is a flag that, when True, will lookup this Provider by provider_id inside the :config:
-        (e.g. for using a dict of configuration for different Providers). If the provider_id isn't found,
-        returns this Provider un-modified.
+            path: str, Path, optional
+                A path to a local registry file to skip the GitHub download.
         """
-        if use_id:
-            if self.provider_id in config:
-                config = config[self.provider_id]
-            elif str(self.provider_id) in config:
-                config = config[str(self.provider_id)]
-            else:
-                return self
+        key = (str(ref), path)
+        if key not in self._registry:
+            self._registry[key] = self._get_registry(*key)
 
-        _kwargs = { **vars(self), **config }
-        return Provider(**_kwargs)
+        self.providers = self._registry[key]
+        self.ref = ref
+        self.path = path
 
+    def __repr__(self):
+        data = "'" + "', '".join([str(self.ref or self.path), str(len(self.providers)) + " providers"]) + "'"
+        return f"<mds.files.Registry ({data})>"
 
-def filter(providers, names):
-    """
-    Filters a list of Provider instances, given one or more case-insensitive names.
-    """
-    if names is None or len(names) == 0:
-        return providers
+    def find(self, provider, **kwargs):
+        """
+        Find a Provider instance in this Registry.
 
-    if isinstance(names, str):
-        names = [names]
+        Parameters:
+            provider: str, UUID
+                A provider_id or provider_name to look for in the registry.
 
-    names = [n.lower() for n in names]
+            Additional keyword arguments are set as attributes on the Provider instance.
 
-    return [p for p in providers if p.provider_name.lower() in names]
+        Return:
+            Provider
+                The matching Provider instance, or None.
+        """
+        try:
+            provider = uuid.UUID(provider)
+        except ValueError:
+            pass
 
+        # filter for matching provider(s)
+        found = next((p for p in self.providers if any([
+            isinstance(provider, str) and p.provider_name.lower() == provider.lower(),
+            isinstance(provider, uuid.UUID) and p.provider_id == provider
+        ])), None)
 
-def get_registry(ref=DEFAULT_REF, file=None):
-    """
-    Parse a Provider registry file; by default, download the official registry from GitHub `master`.
+        # re-init with the record from registry and config
+        return Provider(found, **kwargs) if found else None
 
-    Optionally download from the specified :ref:, which could be any of:
-        - git branch name
-        - commit hash (long or short)
-        - git tag
+    @staticmethod
+    def _get_registry(ref, path):
+        if path:
+            path = pathlib.Path(path)
+            with path.open("r") as f:
+                return Registry._parse_csv(f.readlines(), ref=ref, path=path)
+        else:
+            url = mds.github.registry_url(ref)
+            with requests.get(url, stream=True) as r:
+                lines = (line.decode("utf-8").replace(", ", ",") for line in r.iter_lines())
+                return Registry._parse_csv(lines, ref=ref, path=path)
 
-    Or use the :file: kwarg to skip the download and parse a local registry file.
-    """
-    providers = []
-
-    def __parse(lines):
-        for record in csv.DictReader(lines):
-            providers.append(Provider(**record))
-
-    if file:
-        with open(file, "r") as f:
-            __parse(f.readlines())
-    else:
-        url = PROVIDER_REGISTRY.format(ref or DEFAULT_REF)
-        with requests.get(url, stream=True) as r:
-            lines = (line.decode("utf-8").replace(", ", ",") for line in r.iter_lines())
-            __parse(lines)
-
-    return providers
+    @staticmethod
+    def _parse_csv(lines, **kwargs):
+        """
+        Parse CSV lines into a list of Provider instances.
+        """
+        return [Provider(**record, **kwargs) for record in csv.DictReader(lines)]

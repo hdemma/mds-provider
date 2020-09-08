@@ -3,18 +3,28 @@ Authentication module for MDS API calls.
 """
 
 import requests
-from requests import Session
 
 
 class AuthorizationToken():
     """
     Represents an authenticated session via an Authorization token header.
+
+    To implement a new token-based auth type, create a subclass of AuthorizationToken and implement:
+
+        __init__(self, provider)
+            Initialize self.session.
+
+        @classmethod
+        can_auth(cls, provider): bool
+            Return True if the auth type can be used on the provider.
+
+    See OAuthClientCredentialsAuth for an example implementation.
     """
     def __init__(self, provider):
         """
         Establishes a session for the provider and includes the Authorization token header.
         """
-        session = Session()
+        session = requests.Session()
         session.headers.update({ "Authorization": f"{provider.auth_type} {provider.token}" })
 
         headers = getattr(provider, "headers", None)
@@ -35,7 +45,7 @@ class AuthorizationToken():
         ])
 
 
-class OAuthClientCredentialsAuth(AuthorizationToken):
+class OAuthClientCredentials(AuthorizationToken):
     """
     Represents an authenticated session via OAuth 2.0 client_credentials grant flow.
     """
@@ -66,16 +76,52 @@ class OAuthClientCredentialsAuth(AuthorizationToken):
         ])
 
 
-class SpinClientCredentialsAuth(AuthorizationToken):
+class BoltClientCredentials(AuthorizationToken):
+    """
+    Represents an authenticated session via the Bolt authentication scheme.
+
+    Currently, your config needs:
+
+    * email
+    * password
+    * token_url
+    """
+    def __init__(self, provider):
+        """
+        Acquires the provider token for Bolt before establishing a session.
+        """
+        payload = {
+            "email": provider.email,
+            "password": provider.password
+        }
+        r = requests.post(provider.token_url, params=payload)
+        provider.token = r.json()["token"]
+
+        AuthorizationToken.__init__(self, provider)
+
+    @classmethod
+    def can_auth(cls, provider):
+        """
+        Returns True if this auth type can be used for the provider.
+        """
+        return all([
+            provider.provider_name.lower() == "bolt",
+            hasattr(provider, "email"),
+            hasattr(provider, "password"),
+            hasattr(provider, "token_url")
+        ])
+
+
+class SpinClientCredentials(AuthorizationToken):
     """
     Represents an authenticated session via the Spin authentication scheme, documented at:
     https://web.spin.pm/datafeeds
 
     Currently, your config needs:
-    :email:
-    :password:
-    :mds_api_url: (see https://github.com/CityOfLosAngeles/mobility-data-specification/pull/296)
-    :token_url: (try https://web.spin.pm/api/v1/auth_tokens)
+
+    * email
+    * password
+    * token_url (try https://web.spin.pm/api/v1/auth_tokens)
     """
     def __init__(self, provider):
         """
@@ -108,7 +154,9 @@ def auth_types():
     """
     Return a list of all supported authentication types.
     """
-    types = AuthorizationToken.__subclasses__()
-    types.append(AuthorizationToken)
+    def all_subs(cls):
+        return set(cls.__subclasses__()).union(
+            [s for c in cls.__subclasses__() for s in all_subs(c)]
+        ).union([cls])
 
-    return types
+    return all_subs(AuthorizationToken)

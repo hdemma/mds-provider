@@ -2,72 +2,92 @@
 Generating fake MDS Provider data.
 """
 
-from datetime import datetime, timedelta
+import datetime
 import math
-import mds
-from mds.json import extract_point, to_feature
-from mds.fake.data import random_date_from, random_string, random_file_url
-from mds.fake.geometry import point_within, point_nearby
-from mds.schema import ProviderSchema
 import random
-import scipy.stats
 import uuid
+
+import scipy.stats
+
+import mds.geometry
+from ..fake import geometry, util
+from ..schemas import Schema
+from ..versions import Version
 
 
 BATTERY = "battery_pct"
 EVENT_LOC = "event_location"
 EVENT_TIME = "event_time"
 PROPULSION = "propulsion_type"
+TD_HOUR = datetime.timedelta(seconds=3600)
 
 
-class ProviderDataGenerator:
+class ProviderDataGenerator():
     """
     Generates fake MDS Provider data.
     """
 
-    TD_HOUR = timedelta(seconds=3600)
-
-    def __init__(self, **kwargs):
+    def __init__(self, boundary, **kwargs):
         """
         Initialize a new DataGenerator using the provided context.
 
-        Required keyword arguments:
-            - :boundary: is the geographic boundary within which to generate data
-              see geometry.parse_boundary(:boundary_file:)
+        Parameters:
+            boundary: str
+                The path to a geoJSON file with boundary geometry within which to generate data.
 
-        Optional keyword arguments:
-            - :speed: the average speed of devices (in meters/second)
-            - :vehicle_types: the vehicle_types to use for generation
-            - :propulsion_types: the propulsion_types to use for generation
+            currency: str, optional
+                When cost information is generated, use this ISO 4217 Alphabetic Currency Code.
+
+            speed: int, optional
+                The average speed of devices in meters/second.
+
+            propulsion_types: str, list, optional.
+                Comma-separated string or list of propulsion_types to use for generation.
+
+            vehicle_types: str, list, optional
+                Comma-separated string or list of vehicle_types to use for generation.
+
+            version: str, Version, optional
+                The MDS version to target. By default, use Version.mds_lower().
         """
-        schema = ProviderSchema(mds.TRIPS)
+        self.version = Version(kwargs.pop("version", Version.mds_lower()))
+        self.version.raise_if_unsupported()
 
-        key = "boundary"
-        if not key in kwargs:
-            raise("A geographic boundary is required")
-        self.boundary = kwargs[key]
+        self.boundary = mds.geometry.parse_boundary(boundary)
+        self.trips_schema = Schema.trips(self.version)
+        self.status_schema = Schema.status_changes(self.version)
+        self.speed = kwargs.get("speed", random.randint(4, 9))
 
-        key = "speed"
-        if key in kwargs and kwargs[key] is not None:
-            self.speed = kwargs[key]
+        self.vehicle_types = kwargs.get("vehicle_types", self.trips_schema.vehicle_types)
+        if isinstance(self.vehicle_types, str):
+            self.vehicle_types = self.vehicle_types.split(",")
 
-        key = "vehicle_types"
-        if key in kwargs and kwargs[key] is not None:
-            self.vehicle_types = kwargs[key].split(",")\
-                if isinstance(kwargs[key], str) else kwargs[key]
-        else:
-            self.vehicle_types = schema.vehicle_types()
+        self.propulsion_types = kwargs.get("propulsion_types", self.trips_schema.propulsion_types)
+        if isinstance(self.propulsion_types, str):
+            self.propulsion_types = self.propulsion_types.split(",")
 
-        key = "propulsion_types"
-        if key in kwargs and kwargs[key] is not None:
-            self.propulsion_types = kwargs[key].split(",")\
-                if isinstance(kwargs[key], str) else kwargs[key]
-        else:
-            self.propulsion_types = schema.propulsion_types()
+        self.currency = kwargs.get("currency", "USD")
+
+    def __repr__(self):
+        return f"<mds.fake.ProviderDataGenerator ('{self.version}')>"
 
     def devices(self, N, provider_name, provider_id=None):
         """
-        Create a list of length :N: representing devices operated by :provider:.
+        Create a list of devices operated by a provider.
+
+        Parameters:
+            N: int
+                The number of devices to generate.
+
+            provider_name: str
+                The name of the fictional provider.
+
+            provider_id: str, UUID, optional
+                The identifier of the fictional provider.
+
+        Returns:
+            list
+                A list of dict, each representing a device for the provider.
         """
         devices = []
         provider_id = provider_id or uuid.uuid4()
@@ -76,7 +96,7 @@ class ProviderDataGenerator:
             device = dict(provider_id=provider_id,
                           provider_name=provider_name,
                           device_id=uuid.uuid4(),
-                          vehicle_id=random_string(6),
+                          vehicle_id=util.random_string(6),
                           vehicle_type=random.choice(self.vehicle_types),
                           propulsion_type=[random.choice(self.propulsion_types)])
 
@@ -90,15 +110,27 @@ class ProviderDataGenerator:
 
     def service_day(self, devices, date, hour_open, hour_closed, inactivity):
         """
-        Create status change events and trips on :date: between the hours of
-        :houropen: and :hourclosed: for the given :devices:.
+        Create status_change events and trips for a day of service.
 
-        :inactivity: the percent of devices to mark as inactive for the day
-                     (i.e. start_service and end_service events at the same location with no trips).
+        Parameters:
+            devices: list
+                A list of devices to put into services. See devices().
 
-        Returns a tuple:
-            - status_changes = list of status_change objects for the day
-            - trips = list of trip objects for the day
+            date: date,
+                The date on which to start service.
+
+            hour_open: int
+                The hour of the day that service begins.
+
+            hour_closed: int
+                The hour of the day that service ends.
+
+            inactivity: float
+                The percent of devices to mark as inactive for the day
+                (i.e. start_service and end_service events at the same location with no trips).
+
+        Returns:
+            tuple (status_changes: list, trips: list)
         """
         day_status_changes, day_trips = [], []
         start_time = date.replace(hour=hour_open)
@@ -106,7 +138,7 @@ class ProviderDataGenerator:
 
         # partition the devices into inactive and active
         # inactive will only get start/end service events in the same location
-        inactive_devices = random.sample(devices, int(len(devices)*inactivity))
+        inactive_devices = random.sample(devices, int(len(devices) * inactivity))
         inactive_starts = self.start_service(inactive_devices, start_time)
         inactive_locations = [e[EVENT_LOC] for e in inactive_starts]
         inactive_ends = self.end_service(inactive_devices, end_time, inactive_locations)
@@ -161,24 +193,27 @@ class ProviderDataGenerator:
 
     def service_hour(self, devices, date, hour, times, locations, inactivity):
         """
-        Create status change events and trips for the given :devices: on :date:
-        during the hour of :hour:.
+        Create status_change events and trips for an hour of service.
 
-        :times: is a list of datetime corresponding to :devices:, marking the
-                earliest time for a new event for that device
-                (e.g. for recharge dropoff, trips have to start after)
+        Parameters:
+            times: list
+                A list of datetime marking the earliest time for a new
+                event for that device e.g. for recharge dropoff, trips have to start after
+                (indexable by devices).
 
-        :locations: is a list of the current location of each device (indexable by :devices:).
+            locations: list
+                The current location of each device (indexable by devices).
 
-        :inactivity: is a measure of how inactive the fleet is during this hour
+            inactivity: float
+                A measure of how inactive the fleet is during this hour
 
-        Returns a tuple:
-            - the devices remaining active after this hour
-            - active device event times for this hour
-            - active device event locations for this hour
-            - devices removed this hour
-            - status changes for this hour
-            - trips starting this hour
+        Returns:
+            tuple (active_devices: list,
+                   active_device_event_times: list,
+                   active_device_event_locations: list,
+                   removed_devices: list,
+                   status_changes: list,
+                   trips: list)
         """
         active, removed, changes, trips = [], [], [], []
 
@@ -209,7 +244,7 @@ class ProviderDataGenerator:
                 status, trip = self.device_trip(device,
                                                 event_location=location,
                                                 reference_time=current_time,
-                                                max_td=self.TD_HOUR)
+                                                max_td=TD_HOUR)
                 changes.extend(status)
                 trips.append(trip)
                 # update the device's time and location from the trip's end event
@@ -229,116 +264,156 @@ class ProviderDataGenerator:
 
     def start_service(self, devices, start_time):
         """
-        Create service_change `available:service_start` events on or around :starttime:
-        for each of the :devices:.
+        Create status_change available:service_start events.
+
+        Parameters:
+            devices: list
+                The list of devices to bring into service.
+
+            start_time: datetime
+                The approximate time of service start.
+
+        Return:
+            list
+                The list of service_start events.
         """
-        service_changes = []
+        status_changes = []
 
         # device placement starts before operation open time
         # -7200 seconds == previous 2 hours from start
-        offset = timedelta(seconds=-7200)
+        offset = datetime.timedelta(seconds=-7200)
+
         for device in devices:
             # somewhere in the previous :offset:
-            event_time = random_date_from(start_time, min_td=offset)
-            point = point_within(self.boundary)
-            feature = to_feature(point, properties=dict(timestamp=event_time))
+            event_time = util.random_date_from(start_time, min_td=offset)
+            point = geometry.point_within(self.boundary)
+            feature = mds.geometry.to_feature(point, properties=dict(timestamp=event_time))
 
-            # the service_change details
-            service_start = \
-                self.status_change_event(device,
-                                         event_type="available",
-                                         event_type_reason="service_start",
-                                         event_time=event_time,
-                                         event_location=feature)
-
-            # maybe add an empty associated_trips array
-            if random.choice([False, True]):
-                service_start["associated_trips"] = random.choice([None, []])
+            # the status_change details
+            service_start = self.status_change_event(device,
+                                                     event_type="available",
+                                                     event_type_reason="service_start",
+                                                     event_time=event_time,
+                                                     event_location=feature)
 
             # reset the battery for electric devices
             if self.has_battery(device):
                 self.recharge_battery(device)
 
             # combine with device details and append
-            service_changes.append({**device, **service_start})
+            status_changes.append({**device, **service_start})
 
-        return service_changes
+        return status_changes
 
     def end_service(self, devices, end_time, locations=None):
         """
-        Create service_change `removed:service_end` events for each of :devices:.
+        Create status_change removed:service_end events.
 
-        If :locations: are provided, use the corresponding location for each device.
+        Parameters:
+            devices: list
+                The list of devices to bring into service.
+
+            end_time: datetime
+                The approximate time of service end.
+
+            locations: list, optional
+                The corresponding end location for each device. By default, generate a random location.
+
+        Returns:
+            list
+                The list of status_change events.
         """
-        service_changes = []
+        status_changes = []
 
         # device pickup likely doesn't happen right at close time
         # +7200 seconds == next 2 hours after close
-        offset = timedelta(seconds=7200)
+        offset = datetime.timedelta(seconds=7200)
+
         for device in devices:
             # somewhere in the next :offset:
-            event_time = random_date_from(end_time, max_td=offset)
+            event_time = util.random_date_from(end_time, max_td=offset)
 
             # use the device's index for the locations if provided
             # otherwise generate a random event_location
             if locations is None:
-                point = point_within(self.boundary)
+                point = geometry.point_within(self.boundary)
             else:
-                point = extract_point(locations[devices.index(device)])
+                point = mds.geometry.extract_point(locations[devices.index(device)])
 
-            # the service_change details
-            feature = to_feature(point, properties=dict(timestamp=event_time))
-            service_end = \
-                self.status_change_event(device,
-                                         event_type="removed",
-                                         event_type_reason="service_end",
-                                         event_time=event_time,
-                                         event_location=feature)
+            # the status_change details
+            feature = mds.geometry.to_feature(point, properties=dict(timestamp=event_time))
+            service_end = self.status_change_event(device,
+                                                   event_type="removed",
+                                                   event_type_reason="service_end",
+                                                   event_time=event_time,
+                                                   event_location=feature)
 
             # combine with device details and append
-            service_changes.append({**device, **service_end})
+            status_changes.append({**device, **service_end})
 
-        return service_changes
+        return status_changes
 
     def device_trip(self, device, event_time=None, event_location=None,
-                    end_location=None, reference_time=None, min_td=timedelta(seconds=0),
-                    max_td=timedelta(seconds=0), speed=None):
+                    end_location=None, reference_time=None, min_td=datetime.timedelta(seconds=0),
+                    max_td=datetime.timedelta(seconds=0), speed=None):
         """
-        Create a trip and associated status changes for the given :device:.
+        Create a trip and associated status_changes for a device.
 
-        :event_time: is the time the trip should start
+        Parameters:
+            device: dict
+                The device that will take the trip.
 
-        :event_location: is the location (Feature) the trip should start
+            event_time: datetime, optional
+                The time the trip should start.
 
-        :end_location: is the location (Feature) the trip should end
+            event_location: GeoJSON Feature, optional
+                The location the trip should start.
 
-        :reference_time: is the 0-point around which to calculate a random start time
-            - :min_td: the minimum time from :reference_time:
-            - :max_td: the maximum time from :reference_time:
+            end_location: GeoJSON Feature, optional
+                The location the trip should end.
 
-        :speed: is the average speed of the device in meters/second
+            reference_time: datetime, optional
+                The 0-point around which to calculate a random start time.
 
-        Returns a tuple:
-            - the list of status changes
-            - the trip
+            min_td: timedelta, optional
+                The minimum time in the past from reference_time.
+
+            max_td: timedelta, optional
+                The maximum time in the future of reference_time.
+
+            speed: int, optional
+                The average speed of the device in meters/second.
+
+        Returns:
+            tuple (status_changes: list, trip: dict)
         """
+        if event_time is None and reference_time is None:
+            reference_time = datetime.datetime.utcnow()
+
         if (event_time is None) and (reference_time is not None):
-            event_time = random_date_from(reference_time, min_td=min_td, max_td=max_td)
+            event_time = util.random_date_from(reference_time, min_td=min_td, max_td=max_td)
 
         if event_location is None:
-            point = point_within(self.boundary)
-            event_location = to_feature(point, properties=dict(timestamp=event_time))
+            point = geometry.point_within(self.boundary)
+            event_location = mds.geometry.to_feature(point, properties=dict(timestamp=event_time))
 
         if speed is None:
             speed = self.speed
 
+        # Generate the trip_id to fill the associated_trip key in the status changes
+        trip_id = uuid.uuid4()
+        status_changes_kwargs = { "associated_trip": trip_id }
+
         # begin the trip
-        status_changes = [self.start_trip(device, event_time, event_location)]
+        status_changes = [self.start_trip(device,
+                                          event_time,
+                                          event_location,
+                                          **status_changes_kwargs)]
 
         # random trip duration (in seconds)
         # the gamma distribution is referenced in the literature,
         # see: https://static.tti.tamu.edu/tti.tamu.edu/documents/17-1.pdf
-        # experimenting with the scale factors led to these parameterizations, * 60 to get seconds
+        # experimenting with the scale factors led to this parameterization, * 60 to get seconds
         alpha, beta = 3, 4.5
         trip_duration = random.gammavariate(alpha, beta) * 60
 
@@ -355,11 +430,11 @@ class ProviderDataGenerator:
             self.drain_battery(device, amount=amount, rate=rate)
 
         # calculate out the ending time and location
-        end_time = event_time + timedelta(seconds=trip_duration)
+        end_time = event_time + datetime.timedelta(seconds=trip_duration)
         if end_location is None:
-            start_point = extract_point(event_location)
-            end_point = point_nearby(start_point, trip_distance, boundary=self.boundary)
-            end_location = to_feature(end_point, properties=dict(timestamp=end_time))
+            start_point = mds.geometry.extract_point(event_location)
+            end_point = geometry.point_nearby(start_point, trip_distance, boundary=self.boundary)
+            end_location = mds.geometry.to_feature(end_point, properties=dict(timestamp=end_time))
 
         # generate the route object
         route = self.trip_route(event_location, end_location)
@@ -367,32 +442,39 @@ class ProviderDataGenerator:
         # and finally the trip object
         trip = dict(
             accuracy=int(accuracy),
-            trip_id=uuid.uuid4(),
+            trip_id=trip_id,
             trip_duration=int(trip_duration),
             trip_distance=int(trip_distance),
             route=route,
             start_time=event_time,
-            end_time=end_time
+            end_time=end_time,
+            publication_time=end_time
         )
 
         # add a parking_verification_url?
         if random.choice([True, False]):
-            trip.update(parking_verification_url=random_file_url(device["provider_name"]))
+            trip.update(parking_verification_url=util.random_file_url(device["provider_name"]))
 
         # add a standard_cost?
         if random.choice([True, False]):
             # $1.00 to start and $0.15 a minute thereafter
-            trip.update(standard_cost=(100 + (math.floor(trip_duration/60) - 1) * 15))
+            trip.update(standard_cost=(100 + (math.floor(trip_duration / 60) - 1) * 15))
 
         # add an actual cost?
         if random.choice([True, False]):
             # randomize an actual_cost
             # $0.75 - $1.50 to start, and $0.12 - $0.20 a minute thereafter...
             start, rate = random.randint(75, 150), random.randint(12, 20)
-            trip.update(actual_cost=(start + (math.floor(trip_duration/60) - 1) * rate))
+            trip.update(actual_cost=(start + (math.floor(trip_duration / 60) - 1) * rate))
+
+        if "standard_cost" or "actual_cost" in trip and self.version >= Version._040_():
+            trip.update(currency=self.currency)
 
         # end the trip
-        status_changes.append(self.end_trip(device, end_time, end_location))
+        status_changes.append(self.end_trip(device,
+                                            end_time,
+                                            end_location,
+                                            **status_changes_kwargs))
 
         # merge the device info into the trip
         trip = {**device, **trip}
@@ -403,43 +485,98 @@ class ProviderDataGenerator:
         if EVENT_TIME in trip:
             del trip[EVENT_TIME]
 
-        # return a list of the status changes and the trip
+        # return a list of the status_changes and the trip
         return [{**device, **sc} for sc in status_changes], trip
 
-    def start_trip(self, device, event_time, event_location):
+    def start_trip(self, device, event_time, event_location, **kwargs):
         """
-        Create a `reserved:user_pick_up` status change event.
+        Create a reserved:user_pick_up status_change event.
+
+        Parameters:
+            device: dict
+                The device that will take the trip.
+
+            event_time: datetime
+                The time the trip should start.
+
+            event_location: GeoJSON Feature
+                The location the trip should start.
+
+        Returns:
+            dict
+                A reserved:user_pick_up status_change event.
         """
         return self.status_change_event(
             device,
             event_type="reserved",
             event_type_reason="user_pick_up",
             event_time=event_time,
-            event_location=event_location
+            event_location=event_location,
+            **kwargs
         )
 
     def trip_route(self, start_location, end_location):
         """
-        Create GeoJSON FeatureCollection for the trip's `route`.
+        Create GeoJSON FeatureCollection for the trip's route.
+
+        Parameters:
+            start_location: GeoJSON Feature
+                The location the trip should start.
+
+            end_location: GeoJSON Feature
+                The location the trip should end.
+
+        Returns:
+            dict
+                A GeoJSON FeatureCollection of the start and end locations.
         """
         features = [start_location, end_location]
         return dict(type="FeatureCollection", features=features)
 
-    def end_trip(self, device, event_time, event_location):
+    def end_trip(self, device, event_time, event_location, **kwargs):
         """
-        Create a `available:user_drop_off` status change event.
+        Create an available:user_drop_off status_change event.
+
+        Parameters:
+            device: dict
+                The device that took the trip.
+
+            event_time: datetime
+                The time the trip should end.
+
+            event_location: GeoJSON Feature
+                The location the trip should end.
+
+        Returns:
+            dict
+                An available:user_drop_off status_change event.
         """
         return self.status_change_event(
             device,
             event_type="available",
             event_type_reason="user_drop_off",
             event_time=event_time,
-            event_location=event_location
+            event_location=event_location,
+            **kwargs
         )
 
     def device_lowbattery(self, device, event_time, event_location):
         """
-        Create a `unavailable:low_battery` status change event.
+        Create a unavailable:low_battery status_change event.
+
+        Parameters:
+            device: dict
+                The device that has the low battery.
+
+            event_time: datetime
+                The time when the event occurred.
+
+            event_location: GeoJSON Feature
+                The where location the event occurred.
+
+        Returns:
+            dict
+                An unavailable:low_battery status_change event.
         """
         return self.status_change_event(
             device,
@@ -451,33 +588,41 @@ class ProviderDataGenerator:
 
     def devices_recharged(self, devices, event_times, event_locations=None):
         """
-        Create a `available:maintenance_drop_off` status change event for each of :devices:.
+        Create a available:maintenance_drop_off status_change event for each device.
 
-        :event_times: is an single or list of datetimes:
-            - single datetime: use this as a reference to produce a random event time within the given hour
-            - list with len == len(devices): use the corresponding event_time for each device
+        Parameters:
+            devices: list
+                The list of devices to recharge.
 
-        :event_locations: is an (optional) single or list of locations:
-            - None: generate a random dropoff location for each device
-            - single location: use this as the dropoff location
-            - list with len == len(devices): use the corresponding event_location for each device
+            event_times: datetime, list
+                datetime: a reference to produce a random event time within the given hour.
+                len(list) == len(devices): use the corresponding event_time for each device.
+
+            event_locations: GeoJSON Feature, list, optional
+                None: generate a random dropoff location for each device.
+                Feature: use this as the dropoff location.
+                len(list) == len(devices): use the corresponding event_location for each device.
+
+        Returns:
+            list
+                A list of available:maintenance_drop_off status_change events.
         """
-        service_changes = []
+        status_changes = []
 
         for device in devices:
-            if isinstance(event_times, datetime):
+            if isinstance(event_times, datetime.datetime):
                 # how many seconds until the next hour?
-                diff = (60 - event_times.minute - 1)*60 + (60 - event_times.second)
+                diff = (60 - event_times.minute - 1) * 60 + (60 - event_times.second)
                 # random datetime between event_times and then
-                event_time = random_date_from(event_times, max_td=timedelta(seconds=diff))
+                event_time = util.random_date_from(event_times, max_td=datetime.timedelta(seconds=diff))
             elif len(event_times) == len(devices):
                 # corresponding datetime
                 event_time = event_times[devices.index(device)]
 
             if event_locations is None:
                 # random point
-                point = point_within(self.boundary)
-                event_location = to_feature(point, properties=dict(timestamp=event_time))
+                point = geometry.point_within(self.boundary)
+                event_location = mds.geometry.to_feature(point, properties=dict(timestamp=event_time))
             elif len(event_locations) == len(devices):
                 # corresponding location
                 event_location = event_locations[devices.index(device)]
@@ -486,13 +631,27 @@ class ProviderDataGenerator:
                 event_location = event_locations
 
             # create the event for this device
-            service_changes.append(self.device_recharged(device, event_time, event_location))
+            status_changes.append(self.device_recharged(device, event_time, event_location))
 
-        return service_changes
+        return status_changes
 
     def device_recharged(self, device, event_time, event_location):
         """
-        Create a `available:maintenance_drop_off` status change event.
+        Create an available:maintenance_drop_off status_change event.
+
+        Parameters:
+            device: dict
+                The device that was recharged.
+
+            event_time: datetime
+                The time when the event occurred.
+
+            event_location: GeoJSON Feature
+                The where location the event occurred.
+
+        Returns:
+            dict
+                An available:maintenance_drop_off status_change event.
         """
         self.recharge_battery(device)
         return self.status_change_event(
@@ -503,57 +662,187 @@ class ProviderDataGenerator:
             event_location=event_location
         )
 
-    def status_change_event(self,
-                            device,
-                            event_type,
-                            event_type_reason,
-                            event_time,
-                            event_location,
-                            **kwargs):
+    def status_change_event(self, device, event_type=None, event_type_reason=None,
+                            event_time=None, event_location=None, **kwargs):
         """
-        Create a status change event from the provided data.
+        Create a status_change event from the provided data.
+
+        Parameters:
+            device: dict
+                The device that generated the event.
+
+            event_type: str, optional
+                The type of status_change event.
+
+            event_type_reason: str, optional
+                The reason for this type of status_change event.
+
+            event_time: datetime, optional
+                The time when the event occurred.
+
+            event_location: GeoJSON Feature, optional
+                The location where the event occurred.
+
+            Additional keyword parameters are passed into the event as attributes.
+
+        Returns:
+            dict
+                A dict representation of the status_change data.
         """
+        if event_type is None or event_type_reason is None:
+            event_type, event_type_reason = self.event_pair(event_type, event_type_reason)
+
+        if event_time is None:
+            event_type = util.random_date_from(datetime.datetime.utcnow())
+
+        if event_location is None:
+            point = geometry.point_within(self.boundary)
+            event_location = mds.geometry.to_feature(point, properties=dict(timestamp=event_time))
+
         status_change = dict(event_type=event_type,
                              event_type_reason=event_type_reason,
                              event_time=event_time,
-                             event_location=event_location)
+                             event_location=event_location,
+                             publication_time=event_time)
+
         return {**device, **status_change, **kwargs}
 
-    def has_battery(self, obj):
+    def vehicle_status(self, device, event_type=None, event_type_reason=None,
+                       event_time=None, event_location=None, current_location=None,
+                       battery_pct=None, **kwargs):
         """
-        Determine if :obj: has a battery.
-        """
-        return BATTERY in obj or \
-               any("electric" in pt for pt in obj[PROPULSION]) if PROPULSION in obj else False
+        Create a status event compatible with the vehicles endpoint.
 
-    def recharge_battery(self, obj):
-        """
-        Recharge :obj:'s battery to full
-        """
-        obj[BATTERY] = 1.0
+        Parameters:
+            device: dict
+                The device that generated the event.
 
-    def drain_battery(self, obj, amount=0.0, rate=0.0):
-        """
-        Drain :obj:'s battery by an absolute :amount: and/or by a constant :rate:.
+            event_type: str, optional
+                Event type of most recent status change.
 
-        e.g. new_battery = current_battery - amount
-             new_battery = current_battery * (1 - rate)
-             new_battery = (current_battery - amount) * (1 - rate)
-        """
-        if self.has_battery(obj):
-            obj[BATTERY] = (obj[BATTERY] - amount) * (1 - rate)
+            event_type_reason: str, optional
+                Event type reason of most recent status change.
 
-    def make_payload(self, status_changes=None, trips=None):
-        """
-        Craft the full MDS Provider payload for either :status_changes: or :trips:.
-        """
-        payload = dict(version=mds.VERSION())
+            event_time: datetime, optional
+                Date/time when last status change occurred.
 
-        if status_changes is not None:
-            payload["data"] = dict(status_changes=status_changes)
+            event_location: GeoJSON Feature, optional
+                Location of vehicle's last event.
 
-        if trips is not None:
+            current_location: GeoJSON Feature, optional
+                Current location of vehicle if different from last event.
+
+            battery_pct: decimal, optional
+                Percent battery charge of device, expressed between 0 and 1.
+
+            Additional keyword parameters are passed into the vehicle as attributes.
+
+        Returns:
+            dict
+                A dict representation of the vehicle status data.
+        """
+        if event_type is None or event_type_reason is None:
+            event_type, event_type_reason = self.event_pair(event_type, event_type_reason)
+
+        if event_time is None:
+            event_time = util.random_date_from(datetime.datetime.utcnow())
+
+        if event_location is None:
+            point = geometry.point_within(self.boundary)
+            event_location = mds.geometry.to_feature(point, properties=dict(timestamp=event_time))
+
+        last_status = dict(last_event_time=event_time,
+                           last_event_type=event_type,
+                           last_event_type_reason=event_type_reason,
+                           last_event_location=event_location)
+
+        if current_location:
+            last_status.update(current_location=current_location)
+
+        if battery_pct is not None:
+            last_status.update(battery_pct=battery_pct)
+
+        return {**device, **last_status, **kwargs}
+
+    def event_pair(self, event_type=None, event_type_reason=None):
+        """
+        Create a tuple (event_type, event_type_reason).
+
+        If one or both of the event_type and event_type_reason are not provided,
+        valid value(s) will be chosen.
+
+        Parameters:
+            event_type: str, optional
+                Event type of a status change.
+
+            event_type_reason: str, optional
+                Event type reason of a status change.
+
+        Returns:
+            tuple(str, str)
+                A tuple representation of the event data.
+        """
+        etrs = self.status_schema.event_type_reasons
+
+        if event_type is None and event_type_reason:
+            # invert the {event_type:[event_type_reason]} dict into {event_type_reason:event_type}
+            reason_types = dict([(v,k) for k,reason_list in etrs.items() for v in reason_list])
+            event_type = reason_types[event_type_reason]
+        elif event_type and event_type_reason is None:
+            # pick a random reason for this event_type
+            event_type_reason = random.choice(etrs[event_type])
+        else:
+            # pick a random event_type and corresponding reason
+            event_type = random.choice(list(etrs.keys()))
+            event_type_reason = random.choice(etrs[event_type])
+
+        return (event_type, event_type_reason)
+
+    def has_battery(self, device):
+        """
+        Determine if device has a battery.
+        """
+        return any([
+            BATTERY in device,
+            any("electric" in pt for pt in device[PROPULSION]) if PROPULSION in device else False
+        ])
+
+    def recharge_battery(self, device):
+        """
+        Recharge device's battery to full.
+        """
+        device[BATTERY] = 1.0
+
+    def drain_battery(self, device, amount=0.0, rate=0.0):
+        """
+        Drain device's battery by an absolute amount and/or by a constant rate:
+
+            new_battery = (current_battery - amount) * (1 - rate)
+        """
+        if self.has_battery(device):
+            device[BATTERY] = (device[BATTERY] - amount) * (1 - rate)
+
+    def make_payload(self, **kwargs):
+        """
+        Craft a full MDS Provider payload.
+        """
+        events = kwargs.get("events")
+        status_changes = kwargs.get("status_changes")
+        trips = kwargs.get("trips")
+        vehicles = kwargs.get("vehicles")
+
+        payload = dict(version=str(self.version))
+
+        if events or status_changes:
+            data = events or status_changes
+            payload["data"] = dict(status_changes=data)
+
+        if trips:
             payload["data"] = dict(trips=trips)
 
-        return payload
+        if vehicles:
+            payload["last_updated"] = datetime.datetime.utcnow()
+            payload["ttl"] = random.randint(0, 300)
+            payload["data"] = dict(vehicles=vehicles)
 
+        return payload
